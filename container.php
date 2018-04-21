@@ -25,6 +25,7 @@ use Prooph\Common\Event\ActionEventListenerAggregate;
 use Prooph\Common\Event\ProophActionEventEmitter;
 use Prooph\Common\Messaging\FQCNMessageFactory;
 use Prooph\Common\Messaging\NoOpMessageConverter;
+use Prooph\EventSourcing\AggregateChanged;
 use Prooph\EventSourcing\EventStoreIntegration\AggregateTranslator;
 use Prooph\EventStore\Adapter\Doctrine\DoctrineEventStoreAdapter;
 use Prooph\EventStore\Adapter\Doctrine\Schema\EventStoreSchema;
@@ -32,6 +33,7 @@ use Prooph\EventStore\Adapter\PayloadSerializer\JsonPayloadSerializer;
 use Prooph\EventStore\Aggregate\AggregateRepository;
 use Prooph\EventStore\Aggregate\AggregateType;
 use Prooph\EventStore\EventStore;
+use Prooph\EventStore\Stream\StreamName;
 use Prooph\EventStoreBusBridge\EventPublisher;
 use Prooph\EventStoreBusBridge\TransactionManager;
 use Prooph\ServiceBus\Async\MessageProducer;
@@ -68,7 +70,7 @@ return new ServiceManager([
             return $connection;
         },
 
-        EventStore::class                  => function (ContainerInterface $container) {
+        EventStore::class => function (ContainerInterface $container) {
             $eventBus   = new EventBus();
             $eventStore = new EventStore(
                 new DoctrineEventStoreAdapter(
@@ -138,11 +140,12 @@ return new ServiceManager([
             return $eventStore;
         },
 
-        CommandBus::class                  => function (ContainerInterface $container) : CommandBus {
+        CommandBus::class => function (ContainerInterface $container) : CommandBus {
             $commandBus = new CommandBus();
 
             $commandBus->utilize(new ServiceLocatorPlugin($container));
-            $commandBus->utilize(new class implements ActionEventListenerAggregate {
+            $commandBus->utilize(new class implements ActionEventListenerAggregate
+            {
                 public function attach(ActionEventEmitter $dispatcher)
                 {
                     $dispatcher->attachListener(MessageBus::EVENT_ROUTE, [$this, 'onRoute']);
@@ -184,23 +187,26 @@ return new ServiceManager([
             return $container->get(QueueFactory::class)->create('commands');
         },
 
-        MessageProducer::class => function (ContainerInterface $container) : MessageProducer {
+        MessageProducer::class                                   => function (ContainerInterface $container
+        ) : MessageProducer {
             return new BernardMessageProducer(
-                new Producer($container->get(QueueFactory::class),new EventDispatcher()),
+                new Producer($container->get(QueueFactory::class), new EventDispatcher()),
                 'commands'
             );
         },
 
         // Command -> CommandHandlerFactory
         // this is where most of the work will be done (by you!)
-        Command\RegisterNewBuilding::class => function (ContainerInterface $container) : callable {
+        Command\RegisterNewBuilding::class                       => function (ContainerInterface $container
+        ) : callable {
             $buildings = $container->get(BuildingRepositoryInterface::class);
 
             return function (Command\RegisterNewBuilding $command) use ($buildings) {
                 $buildings->add(Building::new($command->name()));
             };
         },
-        Command\CheckIn::class => function (ContainerInterface $container) : callable {
+        Command\CheckIn::class                                   => function (ContainerInterface $container
+        ) : callable {
             $buildings = $container->get(BuildingRepositoryInterface::class);
 
             return function (Command\CheckIn $command) use ($buildings) {
@@ -209,7 +215,8 @@ return new ServiceManager([
                 $building->checkInUser($command->username());
             };
         },
-        Command\CheckOut::class => function (ContainerInterface $container) : callable {
+        Command\CheckOut::class                                  => function (ContainerInterface $container
+        ) : callable {
             $buildings = $container->get(BuildingRepositoryInterface::class);
 
             return function (Command\CheckOut $command) use ($buildings) {
@@ -218,7 +225,7 @@ return new ServiceManager([
                 $building->checkOutUser($command->username());
             };
         },
-        Command\NotifySecurityOfCheckInAnomaly::class => function () : callable {
+        Command\NotifySecurityOfCheckInAnomaly::class            => function () : callable {
             return function (Command\NotifySecurityOfCheckInAnomaly $command) {
                 error_log(sprintf(
                     'Security anomaly in building "%s" caused by user "%s"',
@@ -236,10 +243,66 @@ return new ServiceManager([
                         $event->building(),
                         $event->username()
                     ));
-                }
+                },
             ];
         },
-        BuildingRepositoryInterface::class => function (ContainerInterface $container) : BuildingRepositoryInterface {
+        'users-projector'                                        => function (ContainerInterface $container
+        ) : callable {
+            $eventStore = $container->get(EventStore::class);
+
+            return function () use ($eventStore) {
+                // Ok, comunque qui abbiamo `Event[]`.
+                // Questo e' solo un esempio di una projection. NON scrivete projection cosi'!
+                // Questo e' solo per fare l'esempio. A partire da Prooph v7, le projection
+                // sono gestite in modo "decente"
+                $pastEventsForThisAggregate = $eventStore->loadEventsByMetadataFrom(
+                    new StreamName('event_stream'),
+                    [
+                        // filters by column "aggregate_type" in the "event_stream" table
+                        'aggregate_type' => Building::class,
+                    ]
+                );
+
+                $users = [];
+
+                /** @var $pastEvent AggregateChanged */
+                foreach ($pastEventsForThisAggregate as $pastEvent) {
+                    if (! isset($users[$pastEvent->aggregateId()])) {
+                        $users[$pastEvent->aggregateId()] = [];
+
+                    }
+                    if ($pastEvent instanceof DomainEvent\UserCheckedIn) {
+                        $users[$pastEvent->aggregateId()][$pastEvent->username()] = null;
+                    }
+
+                    if ($pastEvent instanceof DomainEvent\UserCheckedOut) {
+                        unset($users[$pastEvent->aggregateId()][$pastEvent->username()]);
+                    }
+                }
+
+                // Every key of "$users" is now an aggregate identifier
+                array_walk($users, function (array $users, string $building) {
+                    file_put_contents(
+                        __DIR__ . '/public/building-' . $building . '.json',
+                        json_encode(array_keys($users))
+                    );
+                });
+            };
+        },
+        DomainEvent\UserCheckedIn::class . '-projectors'         => function (ContainerInterface $container) : array {
+            return [
+                $container->get('users-projector'),
+            ];
+        },
+        DomainEvent\UserCheckedOut::class . '-projectors'        => function (ContainerInterface $container) : array {
+            // Now the definition of "projector" and when to actually RUN it is decoupled
+            // This bit just defines WHEN to run it.
+            return [
+                $container->get('users-projector'),
+            ];
+        },
+        BuildingRepositoryInterface::class                       => function (ContainerInterface $container
+        ) : BuildingRepositoryInterface {
             return new BuildingRepository(
                 new AggregateRepository(
                     $container->get(EventStore::class),
